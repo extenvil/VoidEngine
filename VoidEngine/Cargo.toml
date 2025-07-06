@@ -10,8 +10,6 @@ env_logger = "0.10"
 log = "0.4"
 wgpu = "25.0"
 pollster = "0.3"
-wasm-bindgen = "0.2.100"
-wasm-bindgen-futures = "0.4.50"
 bytemuck = { version = "1.16", features = [ "derive" ] }
 imgui-wgpu = "0.25.0"
 imgui = "0.12.0"

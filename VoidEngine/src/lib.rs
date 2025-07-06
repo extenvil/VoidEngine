@@ -1,5 +1,6 @@
 use std::{iter, sync::Arc};
-
+use std::time::Instant;
+use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -8,6 +9,59 @@ use winit::{
     window::Window,
 };
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+        }
+    }
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [-0.0868241, 0.49240386, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // A
+    Vertex {
+        position: [-0.49513406, 0.06958647, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // B
+    Vertex {
+        position: [-0.21918549, -0.44939706, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // C
+    Vertex {
+        position: [0.35966998, -0.3473291, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // D
+    Vertex {
+        position: [0.44147372, 0.2347359, 0.0],
+        color: [0.5, 0.0, 0.5],
+    }, // E
+];
+
+const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, /* padding */ 0];
+
 pub struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -15,6 +69,10 @@ pub struct State {
     config: wgpu::SurfaceConfiguration,
     is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline,
+    // NEW!
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
     window: Arc<Window>,
 }
 
@@ -22,13 +80,18 @@ impl State {
     async fn new(window: Arc<Window>) -> anyhow::Result<State> {
         let size = window.inner_size();
 
+        // The instance is a handle to our GPU
+        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            #[cfg(not(target_arch = "wasm32"))]
-            backends: wgpu::Backends::VULKAN,
+            backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window.clone())?;
+        // # Safety
+        //
+        // The surface needs to live as long as the window that created it.
+        // State owns the window so this should be safe.
+        let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -42,18 +105,18 @@ impl State {
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::default()
-                },
+                // WebGL doesn't support all of wgpu's features, so if
+                // we're building for the web we'll have to disable some.
+                required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
+                trace: wgpu::Trace::Off, // Trace path
             })
             .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
-
+        // Shader code in this tutorial assumes an Srgb surface texture. Using a different
+        // one will result all the colors comming out darker. If you want to support non
+        // Srgb surfaces, you'll need to account for that when drawing to the frame.
         let surface_format = surface_caps
             .formats
             .iter()
@@ -67,8 +130,8 @@ impl State {
             height: size.height,
             present_mode: surface_caps.present_modes[0],
             alpha_mode: surface_caps.alpha_modes[0],
-            desired_maximum_frame_latency: 2,
             view_formats: vec![],
+            desired_maximum_frame_latency: 2,
         };
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -89,7 +152,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[],
+                buffers: &[Vertex::desc()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -110,8 +173,12 @@ impl State {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
+                // Setting this to anything other than Fill requires Features::POLYGON_MODE_LINE
+                // or Features::POLYGON_MODE_POINT
                 polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
             depth_stencil: None,
@@ -120,9 +187,24 @@ impl State {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
+            // If the pipeline will be used with a multiview render pass, this
+            // indicates how many array layers the attachments will have.
             multiview: None,
+            // Useful for optimizing shader compilation on Android
             cache: None,
         });
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let num_indices = INDICES.len() as u32;
 
         Ok(Self {
             surface,
@@ -131,6 +213,9 @@ impl State {
             config,
             is_surface_configured: false,
             render_pipeline,
+            vertex_buffer,
+            index_buffer,
+            num_indices,
             window,
         })
     }
@@ -146,9 +231,17 @@ impl State {
 
     fn update(&mut self) {}
 
+    fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode, pressed: bool) {
+        match (key, pressed) {
+            (KeyCode::Escape, true) => event_loop.exit(),
+            _ => {}
+        }
+    }
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.window.request_redraw();
 
+        // We can't render unless the surface is configured
         if !self.is_surface_configured {
             return Ok(());
         }
@@ -186,20 +279,15 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw(0..3, 0..1);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
 
         Ok(())
-    }
-
-    fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
-        match (code, is_pressed) {
-            (KeyCode::Escape, true) => event_loop.exit(),
-            _ => {}
-        }
     }
 }
 
@@ -222,10 +310,7 @@ impl ApplicationHandler<State> for App {
 
         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.state = Some(pollster::block_on(State::new(window)).unwrap());
-        }
+        self.state = Some(pollster::block_on(State::new(window)).unwrap());
     }
 
     #[allow(unused_mut)]
@@ -248,6 +333,7 @@ impl ApplicationHandler<State> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
+                state.update();
                 match state.render() {
                     Ok(_) => {}
                     // Reconfigure the surface if it's lost or outdated
@@ -280,10 +366,7 @@ impl ApplicationHandler<State> for App {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_logger::init();
-    }
+    env_logger::init();
 
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = App::new();

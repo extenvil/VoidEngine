@@ -154,17 +154,21 @@ impl CameraController {
         }
     }
 
-    fn update_camera(&self, camera: &mut Camera) {
+    fn update_camera(&mut self, camera: &mut Camera, dt: f32) {
+        // Преобразуем в секунды с ограничением максимального значения
+        let dt_seconds = dt.min(0.1); // не более 0.1 секунды (10 FPS)
+        let dt_speed = dt_seconds * self.speed;
+
         use cgmath::InnerSpace;
         let forward = camera.target - camera.eye;
         let forward_norm = forward.normalize();
         let forward_mag = forward.magnitude();
 
-        if self.is_forward_pressed && forward_mag > self.speed {
-            camera.eye += forward_norm * self.speed;
+        if self.is_forward_pressed && forward_mag > dt_speed {
+            camera.eye += forward_norm * dt_speed;
         }
         if self.is_backward_pressed {
-            camera.eye -= forward_norm * self.speed;
+            camera.eye -= forward_norm * dt_speed;
         }
 
         let right = forward_norm.cross(camera.up);
@@ -173,10 +177,10 @@ impl CameraController {
         let forward_mag = forward.magnitude();
 
         if self.is_right_pressed {
-            camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
+            camera.eye = camera.target - (forward + right * dt_speed).normalize() * forward_mag;
         }
         if self.is_left_pressed {
-            camera.eye = camera.target - (forward - right * self.speed).normalize() * forward_mag;
+            camera.eye = camera.target - (forward - right * dt_speed).normalize() * forward_mag;
         }
     }
 }
@@ -411,7 +415,7 @@ impl State {
         });
         let num_indices = INDICES.len() as u32;
 
-        let camera_controller = CameraController::new(0.2);
+        let camera_controller = CameraController::new(2.5);
 
         Ok(Self {
             surface,
@@ -448,19 +452,22 @@ impl State {
     }
 
     fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
+        let now = Instant::now();
+        let dt = now - self.last_fps_instant;
+        self.last_fps_instant = now;
+
+        self.camera_controller.update_camera(&mut self.camera, dt.as_secs_f32());
         self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
 
-        self.frame_count += 1;
-        let now = Instant::now();
+        /*self.frame_count += 1;
         if now.duration_since(self.last_fps_instant) >= Duration::from_secs(1) {
+            println!("test");
             self.fps = self.frame_count;
             self.frame_count = 0;
-            self.last_fps_instant = now;
             let title = format!("{} [FPS: {}]", self.app_name, self.fps);
             self.window.set_title(&title);
-        }
+        }*/
     }
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode, pressed: bool) {
